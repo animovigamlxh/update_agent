@@ -1,15 +1,15 @@
 #!/bin/bash
 
 #
-# Nezha Agent 一键修改服务器地址并重启脚本
+# Nezha 多探针实例修复脚本
 #
-# 使用方法:
-# 1. 上传此脚本到需要修改的 VPS 上。
-# 2. chmod +x update_agent_server.sh
-# 3. sudo ./update_agent_server.sh
+# 功能:
+# 1. 查找所有 nezha-agent 的随机配置文件。
+# 2. 批量修改这些配置文件中的服务器地址。
+# 3. 重启所有 nezha-agent 进程以应用新配置。
 #
 
-# --- 新的服务器地址 (请根据需要修改) ---
+# --- 新的服务器地址 ---
 NEW_SERVER_ADDRESS="8.219.183.120:8008"
 
 # --- 可视化用的颜色定义 ---
@@ -17,6 +17,7 @@ red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
+cyan='\033[0;36m'
 
 # --- 标准化输出函数 ---
 err() {
@@ -36,54 +37,93 @@ info() {
 # 1. 检查 root 权限
 if [ "$(id -u)" -ne 0 ]; then
     err "错误：此脚本需要以 root 权限运行。"
-    info "请尝试使用 'sudo ./update_agent_server.sh'"
+    info "请尝试使用 'sudo ./fix_multiple_agents.sh'"
     exit 1
 fi
 
-# 2. 定义配置文件路径
-CONFIG_FILE="/opt/nezha/agent/config.yml"
-info "目标配置文件: ${CONFIG_FILE}"
+AGENT_DIR="/opt/nezha/agent"
+info "目标Agent目录: ${AGENT_DIR}"
 
-# 3. 检查配置文件是否存在
-if [ ! -f "$CONFIG_FILE" ]; then
-    err "错误: 配置文件 ${CONFIG_FILE} 不存在！"
-    info "请确认此服务器已正确安装 Nezha 探针。"
+if [ ! -d "$AGENT_DIR" ]; then
+    err "错误: 目录 ${AGENT_DIR} 不存在！"
+    info "请确认此服务器已安装 Nezha 探针。"
     exit 1
 fi
-success "✅ 配置文件定位成功。"
 
-# 4. 修改配置文件
-info "正在将服务器地址修改为: ${NEW_SERVER_ADDRESS}..."
+# 2. 查找并批量修改所有配置文件
+info "正在查找所有 config-*.yml 格式的配置文件..."
 
-# 使用 sed 命令进行替换。-i 表示直接修改文件。
-# s|^server:.*|...| 中的 | 是分隔符，避免与地址中的 : 冲突。^server: 匹配以 "server:" 开头的行。
-sed -i "s|^server:.*|server: ${NEW_SERVER_ADDRESS}|" "${CONFIG_FILE}"
+# 使用 find 命令查找文件，并通过 while read 循环处理
+# -print0 和 read -d $'\0' 组合可以安全处理包含特殊字符的文件名
+config_files_found=0
+find "${AGENT_DIR}" -name "config-*.yml" -print0 | while IFS= read -r -d $'\0' file; do
+    config_files_found=$((config_files_found + 1))
+    printf "  -> 正在修改文件: ${cyan}%s${plain}\n" "$file"
+    # 使用 sed 命令进行替换
+    sed -i "s|^server:.*|server: ${NEW_SERVER_ADDRESS}|" "$file"
+    if [ $? -ne 0 ]; then
+        err "    修改失败！请检查文件权限。"
+    fi
+done
 
-if [ $? -ne 0 ]; then
-    err "修改配置文件失败！请检查文件权限。"
-    exit 1
+if [ "$config_files_found" -eq 0 ]; then
+    warn "警告：未找到任何 'config-*.yml' 格式的随机配置文件。"
+    info "脚本将继续尝试修改主配置文件 'config.yml'。"
 fi
-success "✅ 配置文件修改成功。"
 
-# 5. 重启探针服务
-info "正在重启 nezha-agent 服务..."
-systemctl restart nezha-agent
-
-if [ $? -ne 0 ]; then
-    err "重启服务失败！"
-    info "请尝试手动重启: sudo systemctl restart nezha-agent"
-    exit 1
-fi
-success "✅ 服务重启成功。"
-sleep 2
-
-# 6. 检查服务状态
-info "正在检查服务状态..."
-if systemctl is-active --quiet nezha-agent; then
-    success "🎉 Nezha 探针已更新并成功运行！"
-    info "您可以运行 'sudo systemctl status nezha-agent' 查看详细日志。"
+# 3. 额外修改主配置文件 (以防万一)
+MAIN_CONFIG_FILE="${AGENT_DIR}/config.yml"
+if [ -f "$MAIN_CONFIG_FILE" ]; then
+    info "正在修改主配置文件: ${MAIN_CONFIG_FILE}..."
+    sed -i "s|^server:.*|server: ${NEW_SERVER_ADDRESS}|" "$MAIN_CONFIG_FILE"
+    success "  -> 主配置文件修改成功。"
 else
-    err "服务状态异常！请使用 'sudo systemctl status nezha-agent' 查看错误详情。"
+    warn "警告：主配置文件 ${MAIN_CONFIG_FILE} 未找到。"
+fi
+
+success "✅ 所有找到的配置文件均已更新。"
+echo
+
+# 4. 重启所有探针进程
+info "正在重启所有 nezha-agent 进程..."
+
+# 第一步：强制杀死所有现存的 agent 进程
+info "1. 正在强制停止所有旧的 'nezha-agent' 进程..."
+pkill -9 nezha-agent
+# 等待1秒确保进程已终止
+sleep 1
+# 再次检查
+if pgrep -f nezha-agent > /dev/null; then
+    warn "警告：部分进程未能被 pkill 终止，可能需要手动处理。"
+else
+    success "  -> 所有旧进程已停止。"
+fi
+
+# 第二步：重启系统服务
+# 这是基于一个假设：这些失控的进程是由某个主服务启动的。
+# 即使不是，重启主服务也是一个恢复到已知状态的好方法。
+SERVICE_FILE="/etc/systemd/system/nezha-agent.service"
+if [ -f "$SERVICE_FILE" ]; then
+    info "2. 正在通过 systemd 重启主服务..."
+    systemctl restart nezha-agent.service
+    if [ $? -ne 0 ]; then
+        err "通过 systemd 重启服务失败！"
+        info "请尝试手动重启: sudo systemctl restart nezha-agent.service"
+        exit 1
+    fi
+    sleep 2 # 等待服务启动
+    # 检查服务状态
+    if systemctl is-active --quiet nezha-agent.service; then
+        success "  -> 主服务已成功重启并正在运行。"
+    else
+        err "  -> 主服务重启后状态异常！请使用 'systemctl status nezha-agent.service' 查看详情。"
+    fi
+else
+    warn "警告：未找到 systemd 服务文件 ${SERVICE_FILE}。"
+    info "这意味着探针可能是以其他方式启动的，您可能需要手动启动它。"
 fi
 
 echo
+success "🎉 修复脚本执行完毕！"
+info "请稍等片刻，然后检查主面板上的探针状态。"
+echo 
